@@ -1,4 +1,5 @@
 """Booking creation, listing, detail and cancellation."""
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -22,6 +23,23 @@ MIN_DURATION_HOURS = 1
 MAX_DURATION_HOURS = 8
 QUOTA_LIMIT = 3
 QUOTA_WINDOW_HOURS = 24
+
+# Per-resource locks make the conflict/quota check-then-insert atomic without
+# serializing unrelated bookings. The room lock guards double-booking (rule 3);
+# the user lock guards the per-member quota (rule 4). They are always acquired in
+# the order room-then-user, so no two creators can deadlock.
+_room_locks: dict[int, threading.Lock] = {}
+_user_locks: dict[int, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _keyed_lock(registry: dict, key: int) -> threading.Lock:
+    with _locks_guard:
+        lock = registry.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            registry[key] = lock
+        return lock
 
 
 def _pricing_warmup() -> None:
@@ -47,7 +65,7 @@ def _has_conflict(db: Session, room_id: int, start: datetime, end: datetime) -> 
     )
     _pricing_warmup()
     for b in existing:
-        if b.start_time <= end and start <= b.end_time:
+        if b.start_time < end and start < b.end_time:
             return True
     return False
 
@@ -83,42 +101,49 @@ def create_booking(
     end = parse_input_datetime(payload.end_time)
     now = datetime.utcnow()
 
-    if start <= now - timedelta(seconds=300):
+    if start <= now:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "start_time must be in the future")
 
     duration_hours = (end - start).total_seconds() / 3600
     if duration_hours != int(duration_hours):
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration must be a whole number of hours")
     duration_hours = int(duration_hours)
-    if duration_hours > MAX_DURATION_HOURS:
+    if duration_hours < MIN_DURATION_HOURS or duration_hours > MAX_DURATION_HOURS:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
 
     room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == user.org_id).first()
     if room is None:
         raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
 
-    if _has_conflict(db, room.id, start, end):
-        raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
-
-    _check_quota(db, user.id, now, start)
-
+    room_id = room.id
     price_cents = room.hourly_rate_cents * duration_hours
-    booking = Booking(
-        room_id=room.id,
-        user_id=user.id,
-        start_time=start,
-        end_time=end,
-        status="confirmed",
-        reference_code=reference.next_reference_code(),
-        price_cents=price_cents,
-        created_at=now,
-    )
-    db.add(booking)
-    db.commit()
-    db.refresh(booking)
 
-    stats.record_create(room.id, price_cents)
-    cache.invalidate_availability(room.id, start.date().isoformat())
+    # Roll back first so this session holds no read lock while it waits for the
+    # locks and then takes the SQLite write lock inside the critical section.
+    db.rollback()
+    room_lock = _keyed_lock(_room_locks, room_id)
+    user_lock = _keyed_lock(_user_locks, user.id)
+    with room_lock, user_lock:
+        if _has_conflict(db, room_id, start, end):
+            raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+        _check_quota(db, user.id, now, start)
+        booking = Booking(
+            room_id=room_id,
+            user_id=user.id,
+            start_time=start,
+            end_time=end,
+            status="confirmed",
+            reference_code=reference.next_reference_code(),
+            price_cents=price_cents,
+            created_at=now,
+        )
+        db.add(booking)
+        db.commit()
+        db.refresh(booking)
+
+    stats.record_create(room_id, price_cents)
+    cache.invalidate_availability(room_id, start.date().isoformat())
+    cache.invalidate_report(user.org_id)
     notifications.notify_created(booking)
 
     return serialize_booking(booking)
@@ -134,9 +159,9 @@ def list_bookings(
     base = db.query(Booking).filter(Booking.user_id == user.id)
     total = base.count()
     items = (
-        base.order_by(Booking.start_time.desc(), Booking.id.asc())
-        .offset(page * limit)
-        .limit(10)
+        base.order_by(Booking.start_time.asc(), Booking.id.asc())
+        .offset((page - 1) * limit)
+        .limit(limit)
         .all()
     )
     return {
@@ -161,9 +186,10 @@ def get_booking(
     )
     if booking is None:
         raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+    if user.role != "admin" and booking.user_id != user.id:
+        raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
 
     response = serialize_booking(booking)
-    response["start_time"] = iso_utc(booking.created_at)
     response["refunds"] = [
         {
             "amount_cents": r.amount_cents,
@@ -197,28 +223,47 @@ def cancel_booking(
 
     now = datetime.utcnow()
     notice = booking.start_time - now
-    notice_hours = int(notice.total_seconds() // 3600)
-    if notice_hours > 48:
+    if notice >= timedelta(hours=48):
         refund_percent = 100
     elif notice >= timedelta(hours=24):
         refund_percent = 50
     else:
-        refund_percent = 50
+        refund_percent = 0
 
-    refund_amount_cents = round(booking.price_cents * (refund_percent / 100.0))
+    # Nearest cent, half-cents rounding up. Integer math avoids float error and
+    # Python's banker's rounding, and is the single source of the amount so the
+    # response value always equals the value stored in the RefundLog.
+    refund_amount_cents = (booking.price_cents * refund_percent + 50) // 100
 
-    log_refund(db, booking, refund_percent)
+    # Capture immutable fields before the read transaction is dropped below.
+    booking_id_val = booking.id
+    room_id = booking.room_id
+    price_cents = booking.price_cents
+    start_date = booking.start_time.date().isoformat()
 
+    # Atomically claim the cancellation: exactly one concurrent request flips a
+    # still-"confirmed" row, so exactly one RefundLog is written. Roll back first
+    # so this session holds no read lock when it takes the SQLite write lock.
     _settlement_pause()
-    booking.status = "cancelled"
+    db.rollback()
+    claimed = (
+        db.query(Booking)
+        .filter(Booking.id == booking_id_val, Booking.status == "confirmed")
+        .update({Booking.status: "cancelled"}, synchronize_session=False)
+    )
     db.commit()
+    if claimed == 0:
+        raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
 
-    stats.record_cancel(booking.room_id, booking.price_cents)
+    log_refund(db, booking, refund_amount_cents)
+
+    stats.record_cancel(room_id, price_cents)
     cache.invalidate_report(user.org_id)
+    cache.invalidate_availability(room_id, start_date)
     notifications.notify_cancelled(booking)
 
     return {
-        "id": booking.id,
+        "id": booking_id_val,
         "status": "cancelled",
         "refund_percent": refund_percent,
         "refund_amount_cents": refund_amount_cents,
